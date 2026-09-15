@@ -112,6 +112,12 @@ def _release_singleton_lock(handle) -> None:
 class GatewayKanbanWatchersMixin:
     """Kanban watcher / notifier / dispatcher loops for GatewayRunner."""
 
+    # Unattended-dispatch policy state. Declared here so the dispatcher loop
+    # can stash a cached quota reader and remember whether it has already
+    # logged a pause (the warning fires on transition, not every 60s tick).
+    _kanban_quota_guard: "Optional[object]" = None
+    _kanban_quota_paused: bool = False
+
     def _owns_kanban_dispatcher_lock(self) -> bool:
         """Return whether this gateway currently owns the singleton lock."""
         return getattr(self, "_kanban_dispatcher_lock_handle", None) is not None
@@ -1181,7 +1187,79 @@ class GatewayKanbanWatchersMixin:
                 or "database disk image is malformed" in msg
             )
 
-        def _tick_once_for_board(slug: str) -> "Optional[object]":
+        def _build_policy_plan(slugs: "list[str]"):
+            """Compute this tick's board order and global spawn budget.
+
+            Reads config fresh every tick (same contract as auto-decompose):
+            an operator who drops the cap or trips the quota threshold must
+            see it take effect on the next tick, not on the next restart.
+            """
+            from hermes_cli.kanban_policy import (
+                QuotaGuard,
+                count_running,
+                load_policy_config,
+                plan_dispatch,
+            )
+
+            try:
+                from hermes_cli.config import load_config as _load_config
+                cfg = _load_config()
+            except Exception:
+                cfg = {}
+            policy = load_policy_config(cfg)
+
+            running: dict[str, int] = {}
+            for slug in slugs:
+                conn = None
+                try:
+                    conn = _kb.connect(board=slug)
+                    running[slug] = count_running(conn)
+                except Exception:
+                    # A board we cannot read is assumed idle rather than
+                    # skipped: dropping it here would hide it from the plan
+                    # and it would never be dispatched at all.
+                    running[slug] = 0
+                finally:
+                    if conn is not None:
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+
+            guard = getattr(self, "_kanban_quota_guard", None)
+            if guard is None or getattr(guard, "url", None) != policy["quota_url"]:
+                guard = QuotaGuard(
+                    url=policy["quota_url"],
+                    max_age_seconds=policy["quota_max_age_seconds"],
+                    cache_seconds=max(1.0, float(interval)),
+                )
+                self._kanban_quota_guard = guard
+
+            return plan_dispatch(
+                board_running=running, policy=policy, quota_guard=guard
+            )
+
+        def _log_policy_pause(plan) -> None:
+            """Log a quota pause once per transition, not once per tick."""
+            prev = getattr(self, "_kanban_quota_paused", False)
+            if not prev:
+                logger.warning(
+                    "kanban dispatcher: PAUSED, no new cards will be claimed — %s. "
+                    "Running cards continue to completion.",
+                    plan.pause_reason,
+                )
+            self._kanban_quota_paused = True
+
+        def _note_policy_resumed() -> None:
+            if getattr(self, "_kanban_quota_paused", False):
+                logger.info(
+                    "kanban dispatcher: quota back under threshold; resuming claims"
+                )
+            self._kanban_quota_paused = False
+
+        def _tick_once_for_board(
+            slug: str, *, global_budget: "Optional[int]" = None,
+        ) -> "Optional[object]":
             """Run one dispatch_once for a specific board.
 
             Runs in a worker thread via `asyncio.to_thread`. `board=slug`
@@ -1189,6 +1267,11 @@ class GatewayKanbanWatchersMixin:
             `_default_spawn` see the right paths. The per-board DB is
             opened explicitly so concurrent boards never share a
             connection handle or accidentally claim across each other.
+
+            ``global_budget`` is the number of workers the cross-board policy
+            will allow to start anywhere this tick. It narrows this board's
+            ``max_in_progress`` but never widens it: the configured per-board
+            cap still binds when it is the smaller of the two.
             """
             conn = None
             fingerprint = _board_db_fingerprint(slug)
@@ -1222,11 +1305,28 @@ class GatewayKanbanWatchersMixin:
                 # re-ran the migration on a second connection, racing
                 # the first. See the matching comment in
                 # `_kanban_notifier_watcher` and issue #21378.
+                # The global budget narrows this board's caps for this tick.
+                # min() over the configured values means the policy can only
+                # ever tighten: a board capped at 1 stays at 1 even when the
+                # global budget is 2.
+                effective_max_in_progress = max_in_progress
+                effective_max_spawn = max_spawn
+                if global_budget is not None:
+                    effective_max_in_progress = (
+                        global_budget
+                        if max_in_progress is None
+                        else min(max_in_progress, global_budget)
+                    )
+                    effective_max_spawn = (
+                        global_budget
+                        if max_spawn is None
+                        else min(max_spawn, global_budget)
+                    )
                 return _kb.dispatch_once(
                     conn,
                     board=slug,
-                    max_spawn=max_spawn,
-                    max_in_progress=max_in_progress,
+                    max_spawn=effective_max_spawn,
+                    max_in_progress=effective_max_in_progress,
                     failure_limit=failure_limit,
                     stale_timeout_seconds=stale_timeout_seconds,
                     default_assignee=default_assignee,
@@ -1275,15 +1375,69 @@ class GatewayKanbanWatchersMixin:
             Enumerating boards on every tick keeps the dispatcher honest
             when users create a new board mid-run: no restart required,
             the next tick picks it up automatically.
+
+            Before dispatching, the unattended-work policy decides the board
+            ORDER and how many workers may start globally. ``dispatch_once``
+            only ever sees one board, so a global cap and a cross-board
+            priority cannot live inside it: three boards each under their own
+            per-board cap would otherwise run three times the intended number
+            of workers. The policy is advisory-by-construction — it narrows
+            ``max_in_progress`` for this tick and the existing per-board and
+            per-profile caps still apply underneath.
             """
             try:
                 boards = _kb.list_boards(include_archived=False)
             except Exception:
                 boards = [_kb.read_board_metadata(_kb.DEFAULT_BOARD)]
+            slugs = [b.get("slug") or _kb.DEFAULT_BOARD for b in boards]
+
+            policy_plan = None
+            try:
+                policy_plan = _build_policy_plan(slugs)
+            except Exception:
+                # The policy layer must never be able to stop the factory by
+                # failing. Falling through with policy_plan=None preserves the
+                # pre-policy behaviour exactly.
+                logger.exception(
+                    "kanban dispatcher: policy evaluation failed; "
+                    "dispatching without global cap for this tick"
+                )
+
+            if policy_plan is not None and policy_plan.paused:
+                _log_policy_pause(policy_plan)
+                return []
+            if policy_plan is not None:
+                _note_policy_resumed()
+
+            ordered = (
+                [b.slug for b in policy_plan.boards] if policy_plan is not None else slugs
+            )
+
             out: list[tuple[str, "Optional[object]"]] = []
-            for b in boards:
-                slug = b.get("slug") or _kb.DEFAULT_BOARD
-                out.append((slug, _tick_once_for_board(slug)))
+            for slug in ordered:
+                budget = None
+                if policy_plan is not None:
+                    budget = policy_plan.allowed_for(slug)
+                    if budget <= 0:
+                        continue
+                out.append((slug, _tick_once_for_board(slug, global_budget=budget)))
+                if policy_plan is not None:
+                    # Re-count after each board so a spawn on a higher-priority
+                    # board immediately shrinks what the next one may take. The
+                    # plan is computed once per tick, but the budget it hands
+                    # out has to reflect spawns that just happened.
+                    spawned_now = 0
+                    res = out[-1][1]
+                    if res is not None and getattr(res, "spawned", None):
+                        spawned_now = len(res.spawned)
+                    if spawned_now:
+                        policy_plan.global_running += spawned_now
+                        for bp in policy_plan.boards:
+                            bp.allowed = max(
+                                0,
+                                (policy_plan.global_cap or 0)
+                                - policy_plan.global_running,
+                            )
             return out
 
         def _ready_nonempty() -> bool:
