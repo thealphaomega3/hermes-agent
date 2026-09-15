@@ -343,7 +343,7 @@ def order_boards(slugs: list[str], priority: list[str]) -> list[str]:
 
 
 def count_running(conn: sqlite3.Connection) -> int:
-    """Count tasks in ``running`` on one board's connection."""
+    """Count tasks in ``running`` on an already-open board connection."""
     try:
         row = conn.execute(
             "SELECT COUNT(*) FROM tasks WHERE status = 'running'"
@@ -351,6 +351,36 @@ def count_running(conn: sqlite3.Connection) -> int:
         return int(row[0]) if row else 0
     except sqlite3.Error:
         return 0
+
+
+def count_running_readonly(db_path) -> int:
+    """Count ``running`` tasks via a read-only probe, mirroring
+    :func:`hermes_cli.kanban_db.count_notify_subs`.
+
+    The dispatcher needs this count for every board on every tick purely to
+    decide budgets. Opening each board writable for that (as ``connect()``
+    does) would run schema init/migration, take write locks and churn WAL
+    sidecars once a minute per board — and would re-open boards the
+    dispatcher has deliberately quarantined as corrupt. A missing, legacy or
+    unreadable DB counts as zero: an unknown board is treated as idle so it
+    still gets offered a budget rather than being silently starved.
+    """
+    from pathlib import Path
+
+    try:
+        path = Path(db_path)
+        if not path.exists():
+            return 0
+        conn = sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True)
+    except (sqlite3.Error, OSError, ValueError):
+        return 0
+    try:
+        return count_running(conn)
+    finally:
+        try:
+            conn.close()
+        except sqlite3.Error:
+            pass
 
 
 def plan_dispatch(

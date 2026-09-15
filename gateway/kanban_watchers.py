@@ -1196,7 +1196,7 @@ class GatewayKanbanWatchersMixin:
             """
             from hermes_cli.kanban_policy import (
                 QuotaGuard,
-                count_running,
+                count_running_readonly,
                 load_policy_config,
                 plan_dispatch,
             )
@@ -1208,23 +1208,17 @@ class GatewayKanbanWatchersMixin:
                 cfg = {}
             policy = load_policy_config(cfg)
 
+            # Read-only probes only. A writable `connect()` per board per tick
+            # would run schema migration, take write locks, churn WAL sidecars,
+            # and re-open boards this dispatcher has quarantined as corrupt —
+            # all to compute a COUNT. A board we cannot read counts as idle so
+            # it still gets a budget instead of being silently starved.
             running: dict[str, int] = {}
             for slug in slugs:
-                conn = None
                 try:
-                    conn = _kb.connect(board=slug)
-                    running[slug] = count_running(conn)
+                    running[slug] = count_running_readonly(_kb.kanban_db_path(board=slug))
                 except Exception:
-                    # A board we cannot read is assumed idle rather than
-                    # skipped: dropping it here would hide it from the plan
-                    # and it would never be dispatched at all.
                     running[slug] = 0
-                finally:
-                    if conn is not None:
-                        try:
-                            conn.close()
-                        except Exception:
-                            pass
 
             guard = getattr(self, "_kanban_quota_guard", None)
             if guard is None or getattr(guard, "url", None) != policy["quota_url"]:

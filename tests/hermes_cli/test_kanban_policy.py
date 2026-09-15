@@ -16,6 +16,7 @@ from hermes_cli.kanban_policy import (
     DEFAULT_MAX_UNATTENDED_PCT,
     QuotaGuard,
     _parse_openusage,
+    count_running_readonly,
     load_policy_config,
     order_boards,
     plan_dispatch,
@@ -352,6 +353,68 @@ def test_unknown_role_gets_the_most_generous_soft_limit():
     policy = load_policy_config({})
     s, _ = runtime_limits_for_role("tomebound-lead", policy)
     assert s == 9000
+
+
+# --- the running-count probe must not write -----------------------------
+
+
+def _make_board(tmp_path, running=0, done=0):
+    import sqlite3
+
+    db = tmp_path / "kanban.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE tasks (id TEXT PRIMARY KEY, status TEXT)")
+    for i in range(running):
+        conn.execute("INSERT INTO tasks VALUES (?,'running')", (f"r{i}",))
+    for i in range(done):
+        conn.execute("INSERT INTO tasks VALUES (?,'done')", (f"d{i}",))
+    conn.commit()
+    conn.close()
+    return db
+
+
+def test_readonly_probe_counts_only_running(tmp_path):
+    assert count_running_readonly(_make_board(tmp_path, running=2, done=5)) == 2
+
+
+def test_readonly_probe_never_creates_a_missing_db(tmp_path):
+    """The dispatcher probes every board every tick; it must not
+    materialise a DB for a board that does not exist."""
+    missing = tmp_path / "nope" / "kanban.db"
+    assert count_running_readonly(missing) == 0
+    assert not missing.exists()
+
+
+def test_readonly_probe_cannot_write(tmp_path):
+    """Opening ?mode=ro means a schema migration can never run here."""
+    import sqlite3
+
+    db = _make_board(tmp_path, running=1)
+    conn = sqlite3.connect(db.resolve().as_uri() + "?mode=ro", uri=True)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            conn.execute("INSERT INTO tasks VALUES ('x','running')")
+    finally:
+        conn.close()
+
+
+def test_readonly_probe_treats_a_corrupt_db_as_idle(tmp_path):
+    """A quarantined/corrupt board must count as 0, not raise — the
+    dispatcher disables those boards and must not be taken down by one."""
+    db = tmp_path / "kanban.db"
+    db.write_text("not sqlite", encoding="utf-8")
+    assert count_running_readonly(db) == 0
+
+
+def test_readonly_probe_treats_legacy_schema_as_idle(tmp_path):
+    import sqlite3
+
+    db = tmp_path / "kanban.db"
+    conn = sqlite3.connect(db)
+    conn.execute("CREATE TABLE unrelated (x INTEGER)")
+    conn.commit()
+    conn.close()
+    assert count_running_readonly(db) == 0
 
 
 def test_runtime_table_is_overridable_from_config():
