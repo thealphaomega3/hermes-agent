@@ -82,7 +82,9 @@ def test_a_board_capped_at_one_never_spawns_two_even_with_spare_budget():
 
 
 def test_quota_pause_yields_no_boards_to_dispatch():
-    policy = load_policy_config({"kanban": {"quota": {"max_unattended_pct": 75}}})
+    policy = load_policy_config(
+        {"kanban": {"quota": {"enabled": True, "max_unattended_pct": 75}}}
+    )
     guard = QuotaGuard(fetch_fn=lambda: _payload(session=88), cache_seconds=0)
     plan = plan_dispatch(
         board_running={"tomebound": 0, "koctakip": 0},
@@ -96,7 +98,9 @@ def test_quota_pause_yields_no_boards_to_dispatch():
 
 
 def test_in_flight_work_is_reported_but_not_cancelled_during_a_pause():
-    policy = load_policy_config({"kanban": {"quota": {"max_unattended_pct": 75}}})
+    policy = load_policy_config(
+        {"kanban": {"quota": {"enabled": True, "max_unattended_pct": 75}}}
+    )
     guard = QuotaGuard(fetch_fn=lambda: _payload(session=88), cache_seconds=0)
     plan = plan_dispatch(
         board_running={"tomebound": 2},
@@ -118,7 +122,9 @@ def test_quota_source_down_does_not_pause_by_default():
     def dead():
         raise OSError("connection refused")
 
-    policy = load_policy_config({"kanban": {"quota": {"max_unattended_pct": 75}}})
+    policy = load_policy_config(
+        {"kanban": {"quota": {"enabled": True, "max_unattended_pct": 75}}}
+    )
     guard = QuotaGuard(fetch_fn=dead, cache_seconds=0)
     plan = plan_dispatch(
         board_running={"tomebound": 0}, policy=policy, quota_guard=guard
@@ -132,7 +138,7 @@ def test_quota_source_down_pauses_when_configured_to_fail_closed():
         raise OSError("connection refused")
 
     policy = load_policy_config(
-        {"kanban": {"quota": {"max_unattended_pct": 75, "allow_on_unknown": False}}}
+        {"kanban": {"quota": {"enabled": True, "max_unattended_pct": 75, "allow_on_unknown": False}}}
     )
     guard = QuotaGuard(fetch_fn=dead, cache_seconds=0)
     plan = plan_dispatch(

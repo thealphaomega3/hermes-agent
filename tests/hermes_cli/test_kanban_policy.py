@@ -265,7 +265,7 @@ def test_threshold_breach_pauses_every_board():
             "kanban": {
                 "global_max_in_progress": 2,
                 "board_priority": ["tomebound", "koctakip", "asistan"],
-                "quota": {"max_unattended_pct": 75},
+                "quota": {"enabled": True, "max_unattended_pct": 75},
             }
         }
     )
@@ -283,7 +283,9 @@ def test_threshold_breach_pauses_every_board():
 
 def test_pause_does_not_disturb_running_work():
     """D10: running cards finish; only new claims stop."""
-    policy = load_policy_config({"kanban": {"quota": {"max_unattended_pct": 75}}})
+    policy = load_policy_config(
+        {"kanban": {"quota": {"enabled": True, "max_unattended_pct": 75}}}
+    )
     guard = _guard(_usage_payload(session=90))
     plan = plan_dispatch(
         board_running={"tomebound": 2}, policy=policy, quota_guard=guard, now=_fresh_now()
@@ -294,7 +296,9 @@ def test_pause_does_not_disturb_running_work():
 
 
 def test_under_threshold_does_not_pause():
-    policy = load_policy_config({"kanban": {"quota": {"max_unattended_pct": 75}}})
+    policy = load_policy_config(
+        {"kanban": {"quota": {"enabled": True, "max_unattended_pct": 75}}}
+    )
     guard = _guard(_usage_payload(session=23))
     plan = plan_dispatch(
         board_running={"tomebound": 0}, policy=policy, quota_guard=guard, now=_fresh_now()
@@ -312,13 +316,40 @@ def test_defaults_apply_to_an_empty_config():
     assert p["board_priority"] == []
 
 
+def test_quota_guard_is_off_unless_explicitly_enabled():
+    """The guard does real network I/O, so an absent config block must mean
+    OFF. Defaulting it on made the dispatcher tests depend on the host's
+    live account usage — they passed at 23% quota and failed at 97%."""
+    assert load_policy_config({})["quota_enabled"] is False
+    assert load_policy_config({"kanban": {}})["quota_enabled"] is False
+    assert load_policy_config({"kanban": {"quota": {}}})["quota_enabled"] is False
+    assert (
+        load_policy_config({"kanban": {"quota": {"enabled": True}}})["quota_enabled"]
+        is True
+    )
+
+
+def test_plan_never_touches_the_network_without_opt_in():
+    """plan_dispatch must not consult a guard it was not told to use."""
+
+    def boom():
+        raise AssertionError("quota endpoint must not be contacted")
+
+    plan = plan_dispatch(
+        board_running={"tomebound": 0},
+        policy=load_policy_config({}),
+        quota_guard=QuotaGuard(fetch_fn=boom, cache_seconds=0),
+    )
+    assert not plan.paused
+
+
 def test_malformed_values_fall_back_rather_than_raising():
     p = load_policy_config(
         {
             "kanban": {
                 "global_max_in_progress": "banana",
                 "board_priority": "not-a-list",
-                "quota": {"max_unattended_pct": 999},
+                "quota": {"enabled": True, "max_unattended_pct": 999},
             }
         }
     )

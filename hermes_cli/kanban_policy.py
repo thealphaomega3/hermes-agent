@@ -316,7 +316,13 @@ def load_policy_config(cfg: Optional[dict]) -> dict:
             kan.get("global_max_in_progress"), DEFAULT_GLOBAL_MAX_IN_PROGRESS
         ),
         "board_priority": priority,
-        "quota_enabled": bool(quota.get("enabled", True)),
+        # Opt-IN, not opt-out. The guard makes a real HTTP call, so defaulting
+        # it on means any install without a `kanban.quota` block silently
+        # gains a network dependency in its dispatch path — and any test that
+        # drives the dispatcher starts depending on the host's live account
+        # usage, passing or failing according to how much quota the developer
+        # happens to have left. An absent config block means "no guard".
+        "quota_enabled": bool(quota.get("enabled", False)),
         "quota_url": str(quota.get("url") or DEFAULT_QUOTA_URL),
         "quota_threshold_pct": _pct(
             quota.get("max_unattended_pct"), DEFAULT_MAX_UNATTENDED_PCT
