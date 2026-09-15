@@ -97,6 +97,11 @@ def contains_gateway_lifecycle_command(text: str) -> bool:
     if not text:
         return False
     normalized = _SHELL_LINE_CONTINUATION.sub(" ", text)
+    # Continuations are collapsed FIRST: a `#` comment ends at the real newline,
+    # and a backslash at the end of a comment line does not continue it, so
+    # stripping comments before this substitution could splice a comment's tail
+    # onto the next line.
+    normalized = _strip_comment_lines(normalized)
     return bool(_GATEWAY_LIFECYCLE_PATTERN.search(normalized))
 
 
@@ -112,10 +117,113 @@ _CONTROL_CHARS = frozenset(";&|()")
 _ReadRemoteScriptFn = Callable[[str], Optional[str]]
 
 
+# A heredoc operator (`<< EOF`, `<<-'EOF'`, `<< "EOF"`) introduces a body that
+# the shell passes to the command as DATA on stdin, never parses as shell code.
+# The delimiter may be quoted; the quoting only controls parameter expansion
+# inside the body, not where the body ends.
+_HEREDOC_OPENER = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
+
+
+def _iter_shell_statement_lines(text: str) -> Iterator[str]:
+    """Split *text* into shell statements at NEWLINES THAT ARE REAL SEPARATORS.
+
+    A bare ``splitlines()`` is wrong twice over, and both mistakes fail the
+    same way: they hand fragments of non-shell text to the lexer, which
+    tokenizes them into paths the caller then treats as referenced scripts.
+
+    1. A newline inside a quoted string is data, not a separator. Splitting a
+       multi-line ``python3 -c "...."`` on it lexes each line of PYTHON as its
+       own shell command, so ``with open('/some/data.jsonl') as f:`` yields
+       ``/some/data.jsonl`` as an "executable" - and a data file that is a
+       directory or over the size cap then fails closed as unsafe, blocking an
+       innocent command outright.
+    2. A heredoc body is stdin data for the same reason, so ``python3 - <<'EOF'``
+       followed by Python source hits the identical failure.
+
+    Tracking quotes and skipping heredoc bodies keeps the guard scanning only
+    text the shell would actually execute. The fail-closed behaviour for
+    genuinely unreadable or oversized SCRIPTS is deliberate and unchanged - the
+    bug was never that it fails closed, it is that these inputs were not
+    scripts in the first place.
+    """
+    buffer: list[str] = []
+    quote: Optional[str] = None
+    escaped = False
+    pending_heredocs: list[str] = []
+    heredoc_delimiter: Optional[str] = None
+
+    def _flush() -> Iterator[str]:
+        nonlocal buffer, pending_heredocs, heredoc_delimiter
+        line = "".join(buffer)
+        buffer = []
+        if heredoc_delimiter is None:
+            for match in _HEREDOC_OPENER.finditer(line):
+                pending_heredocs.append(match.group(2))
+            yield line
+        if pending_heredocs and heredoc_delimiter is None:
+            heredoc_delimiter = pending_heredocs.pop(0)
+
+    for char in text:
+        if heredoc_delimiter is not None:
+            # Inside a heredoc body: consume verbatim until the delimiter line.
+            if char == "\n":
+                if "".join(buffer).strip() == heredoc_delimiter:
+                    heredoc_delimiter = pending_heredocs.pop(0) if pending_heredocs else None
+                buffer = []
+            else:
+                buffer.append(char)
+            continue
+
+        if escaped:
+            buffer.append(char)
+            escaped = False
+            continue
+        if char == "\\" and quote != "'":
+            buffer.append(char)
+            escaped = True
+            continue
+        if quote is not None:
+            buffer.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in "'\"":
+            quote = char
+            buffer.append(char)
+            continue
+        if char == "\n":
+            yield from _flush()
+            continue
+        buffer.append(char)
+
+    if heredoc_delimiter is None:
+        yield from _flush()
+
+
+_COMMENT_LINE = re.compile(r"(?m)^[ \t]*#.*$")
+
+
+def _strip_comment_lines(text: str) -> str:
+    """Blank out whole-line ``#`` comments before a raw-regex lifecycle scan.
+
+    ``_iter_command_segments`` already drops comments (``lexer.commenters``),
+    but ``contains_gateway_lifecycle_command`` is a raw regex over the whole
+    text and has no such notion. A script that merely DOCUMENTS the foot-gun -
+    ``# never run `hermes gateway restart` from inside a card`` - therefore
+    reads as the foot-gun itself and blocks the script that contains it.
+
+    Lines are blanked rather than deleted so line structure is preserved: every
+    lifecycle branch uses ``[^\\n]*`` between its verb and the gateway
+    identifier specifically so a match cannot span unrelated lines, and
+    collapsing lines here would hand it exactly that opportunity.
+    """
+    return _COMMENT_LINE.sub("", text)
+
+
 def _iter_command_segments(command: str) -> Iterator[list[str]]:
     """Yield shell-tokenized command segments, honoring quotes and comments."""
     normalized = command.replace("\\\n", "")
-    for line in normalized.splitlines() or [normalized]:
+    for line in _iter_shell_statement_lines(normalized):
         try:
             lexer = shlex.shlex(
                 line,
@@ -170,11 +278,31 @@ def contains_launchctl_submit_command(command: str) -> bool:
     return False
 
 
-def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Path:
-    path = Path(candidate).expanduser()
-    if not path.is_absolute():
-        path = Path(cwd or Path.cwd()) / path
-    return path
+def _resolve_terminal_script_path(candidate: str, cwd: Optional[str]) -> Optional[Path]:
+    """Resolve a candidate script reference, or None when it cannot be a path.
+
+    Returns None instead of raising. Every input here is UNTRUSTED text that
+    was tokenized out of a command - when the recursion walks a binary, the
+    tokenizer emits machine-code fragments, and a fragment starting with ``~``
+    reaches ``expanduser``. That raises ``RuntimeError`` (NOT OSError/ValueError)
+    when the user database has no entry for the "username" it parsed out, and
+    the exception propagated all the way through ``terminal_tool`` and killed
+    the whole tool call - 23 times across two profiles in one day.
+
+    ``Path()`` and ``Path.cwd()`` are inside the guard for the same reason: a
+    NUL byte raises ``ValueError`` from the constructor, and ``Path.cwd()``
+    raises ``OSError`` when the process cwd has been unlinked. A guard must
+    never be the thing that crashes the operation it guards, so the failure
+    mode here is "this token is not a resolvable script path" - which is the
+    truth - rather than an exception.
+    """
+    try:
+        path = Path(candidate).expanduser()
+        if not path.is_absolute():
+            path = Path(cwd or Path.cwd()) / path
+        return path
+    except (RuntimeError, ValueError, OSError):
+        return None
 
 
 def _iter_referenced_shell_scripts(
@@ -182,17 +310,32 @@ def _iter_referenced_shell_scripts(
     *,
     cwd: Optional[str] = None,
 ) -> Iterator[Path]:
-    """Yield scripts executed directly or through a POSIX shell."""
+    """Yield scripts executed directly or through a POSIX shell.
+
+    Unresolvable candidates are dropped rather than yielded: the resolver
+    returns None for tokens that cannot be a path at all, and a caller that
+    treated None as a script would reintroduce the crash one frame later.
+    """
+
+    def _emit(candidate: str) -> Iterator[Path]:
+        resolved = _resolve_terminal_script_path(candidate, cwd)
+        if resolved is not None:
+            yield resolved
+
     for segment in _iter_command_segments(command):
         index = _command_token_index(segment)
         if index is None:
             continue
         executable = segment[index]
-        executable_name = Path(executable).name
+        try:
+            executable_name = Path(executable).name
+        except ValueError:
+            # Embedded NUL from tokenized machine code - not an executable.
+            continue
 
         if executable_name in {".", "source"}:
             if len(segment) > index + 1:
-                yield _resolve_terminal_script_path(segment[index + 1], cwd)
+                yield from _emit(segment[index + 1])
             continue
 
         if executable_name in _SHELL_EXECUTABLES:
@@ -216,7 +359,7 @@ def _iter_referenced_shell_scripts(
                 "-c",
                 "--command",
             }:
-                yield _resolve_terminal_script_path(arguments[arg_index], cwd)
+                yield from _emit(arguments[arg_index])
             continue
 
         # A bare "/" token is pathlib's division operator in Python sources
@@ -226,7 +369,7 @@ def _iter_referenced_shell_scripts(
         # (#77131). Skip pure-separator tokens.
         if executable.strip("/"):
             if "/" in executable or executable.endswith((".sh", ".bash", ".zsh")):
-                yield _resolve_terminal_script_path(executable, cwd)
+                yield from _emit(executable)
 
 
 def _iter_shell_command_payloads(command: str) -> Iterator[str]:
@@ -258,7 +401,15 @@ def _read_referenced_script(path: Path) -> tuple[Optional[str], bool]:
     flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
     try:
         descriptor = os.open(path, flags)
-    except OSError:
+    except (OSError, ValueError):
+        # ValueError: os.open raises it, NOT OSError, for a path containing an
+        # embedded NUL byte - which is exactly what the recursion feeds in when
+        # a command names a real binary (Godot.app/.../Godot): the binary's
+        # machine code is tokenized and junk paths come back out. The caller at
+        # _contains_unsafe_gateway_action already catches ValueError from
+        # Path.resolve for this same reason (#76762), but the fix stopped one
+        # call short, so the guard still crashed here and took the whole
+        # terminal tool down with it. A guarded path must never crash the guard.
         return None, False
     try:
         metadata = os.fstat(descriptor)
@@ -374,7 +525,18 @@ def _resolve_script_path(script_path: str) -> Path:
     """
     from hermes_constants import get_hermes_home
 
-    raw = Path(script_path).expanduser()
+    try:
+        raw = Path(script_path).expanduser()
+    except (RuntimeError, ValueError, OSError):
+        # `~nosuchuser/...` raises RuntimeError here just as it does on the
+        # terminal path. A cron `script` value is user-supplied rather than
+        # tokenizer output, so this is far less likely - but "less likely" is
+        # not a reason for the guard to be the thing that crashes job
+        # creation. Fall back to the literal, unexpanded path: it will simply
+        # fail to open, which `_read_script_for_scanning` already handles by
+        # returning empty text so ordinary scheduler path validation reports
+        # the bad path with a useful message.
+        raw = Path(script_path.lstrip("~") or ".")
     if raw.is_absolute():
         return raw
     return get_hermes_home() / "scripts" / raw

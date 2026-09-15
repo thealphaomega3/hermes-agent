@@ -810,7 +810,13 @@ class TestTerminalToolGatewayLifecycleGuardRemote:
             def execute(self, command, **kwargs):
                 calls.append(command)
                 if "cat" in command and "/remote/workspace/remote.sh" in command:
-                    return {"output": "#!/bin/bash\\nhermes gateway restart\\n", "returncode": 0}
+                    # Real newlines: `cat` returns file CONTENT, so the guard
+                    # must see the command on its own line. With the literal
+                    # two-character "\n" this fixture used to send, the whole
+                    # payload is a single line beginning with "#" - which a
+                    # shell parses as one comment and executes nothing, so
+                    # there would be no lifecycle command here to block.
+                    return {"output": "#!/bin/bash\nhermes gateway restart\n", "returncode": 0}
                 return {"output": "", "returncode": 0}
 
         fake_env = _RemoteEnv()
@@ -857,3 +863,185 @@ class TestCronCreateLifecycleBlockExtra:
         assert rc == 1
         out = capsys.readouterr().out
         assert "Blocked" in out
+
+
+# ---------------------------------------------------------------------------
+# Guard robustness: the guard must never crash or false-positive the command
+# it guards.  Three defects, all observed in production on 2026-09-15 across
+# the tb-coder / tb-tester profiles.
+# ---------------------------------------------------------------------------
+
+class TestGuardNeverCrashesOnUntrustedTokens:
+    """`expanduser` on tokenizer output must not take down the terminal tool.
+
+    When the reference walk recurses into a binary, the binary's machine code
+    is tokenized and junk "paths" come back out.  A junk token beginning with
+    `~` reaches `Path.expanduser()`, which raises RuntimeError - not OSError,
+    not ValueError - when no home directory can be determined for the parsed
+    "username".  That exception propagated out of the guard, through
+    tools/terminal_tool.py, and failed the entire tool call.
+    """
+
+    @pytest.mark.parametrize("token", [
+        "~zz9nouserzz/script.sh",       # no such user -> RuntimeError
+        "~\x8a/fragment.sh",            # Mach-O byte fragment
+        "~!@#$%/nonsense.sh",
+    ])
+    def test_resolver_returns_none_instead_of_raising(self, token):
+        from cron.lifecycle_guard import _resolve_terminal_script_path
+
+        assert _resolve_terminal_script_path(token, "/tmp") is None
+
+    @pytest.mark.parametrize("command", [
+        "bash ~zz9nouserzz/script.sh",
+        "sh -c 'source ~\x8a/fragment.sh'",
+        ". ~zz9nouserzz/profile.sh",
+    ])
+    def test_guard_does_not_raise_on_unresolvable_home(self, command):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        # The assertion that matters is that this returns at all.
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd="/tmp"
+        ) is False
+
+    def test_cron_script_resolver_survives_bad_home(self):
+        """The cron-path resolver has the same expanduser exposure."""
+        from cron.lifecycle_guard import _resolve_script_path
+
+        assert _resolve_script_path("~zz9nouserzz/job.sh") is not None
+
+
+class TestCommentLinesAreNotCommands:
+    """A script that DOCUMENTS the foot-gun is not the foot-gun.
+
+    `_iter_command_segments` already honours `#` via lexer.commenters, but
+    `contains_gateway_lifecycle_command` is a raw regex with no such notion,
+    so a comment mentioning the command read as the command itself.
+    """
+
+    @pytest.mark.parametrize("text", [
+        "# never run `hermes gateway restart` from inside a card\necho ok\n",
+        "#hermes gateway stop\n",
+        "  \t# launchctl bootstrap gui/501 ai.hermes.gateway.plist <- do not\n",
+        "echo hi\n# systemctl restart hermes-gateway would kill the run\n",
+    ])
+    def test_commented_lifecycle_mention_is_not_blocked(self, text):
+        assert not _contains_gateway_lifecycle_command(text)
+
+    def test_referenced_script_with_only_a_comment_is_allowed(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        script = tmp_path / "ci.sh"
+        script.write_text(
+            "#!/usr/bin/env bash\n"
+            "# Do NOT run `hermes gateway restart` from inside a card.\n"
+            "echo ok\n"
+        )
+        assert not contains_gateway_lifecycle_command_or_referenced_script(
+            f"bash {script}", cwd=str(tmp_path)
+        )
+
+    @pytest.mark.parametrize("text", [
+        # A real command on its own line, with an unrelated comment above.
+        "# this is fine\nhermes gateway restart\n",
+        # Trailing `#` does not comment out a whole line.
+        "hermes gateway restart  # oops\n",
+    ])
+    def test_real_command_still_blocked_around_comments(self, text):
+        assert _contains_gateway_lifecycle_command(text)
+
+
+class TestQuotedAndHeredocBodiesAreData:
+    """Newlines inside quotes / heredocs are data, not statement separators.
+
+    Splitting on every newline lexed each line of an embedded Python program
+    as its own shell command, so a data-file path inside the program became a
+    "referenced script".  When that path was a directory or exceeded the 1 MiB
+    read cap, the guard failed closed and blocked an entirely innocent
+    command.  Both shapes below are verbatim reproductions from the
+    tb-coder / tb-tester transcripts.
+    """
+
+    def test_multiline_python_dash_c_with_oversized_data_file(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        data = tmp_path / "events.jsonl"
+        data.write_text("x" * (1024 * 1024 + 64))  # over _MAX_REFERENCED_SCRIPT_BYTES
+        command = (
+            f'wc -l {data}; python3 -c "\n'
+            "import json\n"
+            f"with open('{data}') as f:\n"
+            "    for line in f:\n"
+            "        pass\n"
+            '"\n'
+        )
+        assert not contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        )
+
+    def test_heredoc_body_referencing_a_directory(self, tmp_path):
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        (tmp_path / "runs").mkdir()
+        command = (
+            "python3 - << 'EOF'\n"
+            "import glob\n"
+            f'stats = glob.glob("{tmp_path / "runs"}" + "/*.jsonl")\n'
+            "print(stats)\n"
+            "EOF\n"
+        )
+        assert not contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd=str(tmp_path)
+        )
+
+    def test_lifecycle_command_inside_quoted_python_still_blocked(self):
+        """Relaxing the split must not open a laundering channel."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        command = (
+            'python3 -c "\n'
+            "import os\n"
+            "os.system('hermes gateway restart')\n"
+            '"\n'
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd="/tmp"
+        )
+
+    def test_lifecycle_command_in_executed_heredoc_still_blocked(self):
+        """`bash <<EOF` really does execute its body."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        command = "bash <<'EOF'\nhermes gateway restart\nEOF\n"
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd="/tmp"
+        )
+
+    def test_statement_after_heredoc_is_still_scanned(self):
+        """The body is skipped; the command AFTER the terminator is not."""
+        from cron.lifecycle_guard import (
+            contains_gateway_lifecycle_command_or_referenced_script,
+        )
+
+        command = (
+            "python3 - <<'EOF'\n"
+            "print('inert')\n"
+            "EOF\n"
+            "hermes gateway restart\n"
+        )
+        assert contains_gateway_lifecycle_command_or_referenced_script(
+            command, cwd="/tmp"
+        )
