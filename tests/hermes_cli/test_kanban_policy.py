@@ -14,6 +14,7 @@ import pytest
 
 from hermes_cli.kanban_policy import (
     DEFAULT_MAX_UNATTENDED_PCT,
+    UNLIMITED,
     QuotaGuard,
     _parse_openusage,
     count_running_readonly,
@@ -314,6 +315,77 @@ def test_defaults_apply_to_an_empty_config():
     assert p["global_max_in_progress"] == 2
     assert p["quota_threshold_pct"] == DEFAULT_MAX_UNATTENDED_PCT
     assert p["board_priority"] == []
+
+
+def test_zero_global_cap_means_no_cap_not_the_default():
+    """0 is an explicit off switch, not a malformed value.
+
+    It previously went through the positive-int coercion and came back as
+    the default of 2 — so an operator lifting the cross-board limit got the
+    cap re-imposed, silently, with nothing in the log.
+    """
+    assert load_policy_config({"kanban": {"global_max_in_progress": 0}})[
+        "global_max_in_progress"
+    ] is None
+    # Absent still means "use the default".
+    assert load_policy_config({})["global_max_in_progress"] == 2
+    # Garbage still falls back rather than disabling the cap by accident.
+    assert load_policy_config({"kanban": {"global_max_in_progress": "abc"}})[
+        "global_max_in_progress"
+    ] == 2
+
+
+def test_disabled_global_cap_lets_every_board_through():
+    plan = plan_dispatch(
+        board_running={"tomebound": 3, "koctakip": 2},
+        policy=load_policy_config({"kanban": {"global_max_in_progress": 0}}),
+        quota_guard=None,
+    )
+    assert not plan.paused
+    # Already well past the old cap of 2, yet still dispatching.
+    assert plan.allowed_for("tomebound") == UNLIMITED
+    assert plan.allowed_for("koctakip") == UNLIMITED
+
+
+def test_disabled_global_cap_still_honours_board_priority():
+    """Removing the ceiling must not remove the ordering."""
+    plan = plan_dispatch(
+        board_running={"asistan": 0, "tomebound": 0, "koctakip": 0},
+        policy=load_policy_config(
+            {
+                "kanban": {
+                    "global_max_in_progress": 0,
+                    "board_priority": ["tomebound", "koctakip", "asistan"],
+                }
+            }
+        ),
+        quota_guard=None,
+    )
+    assert [b.slug for b in plan.boards] == ["tomebound", "koctakip", "asistan"]
+
+
+def test_quota_guard_still_pauses_when_the_cap_is_disabled():
+    """The cap and the quota guard are independent brakes. Turning off the
+    concurrency limit must not also disable spend protection."""
+
+    class _Guard:
+        def evaluate(self, **_kw):
+            return False, "quota 99% >= 75%"
+
+    plan = plan_dispatch(
+        board_running={"tomebound": 0},
+        policy=load_policy_config(
+            {
+                "kanban": {
+                    "global_max_in_progress": 0,
+                    "quota": {"enabled": True, "max_unattended_pct": 75},
+                }
+            }
+        ),
+        quota_guard=_Guard(),
+    )
+    assert plan.paused
+    assert plan.allowed_for("tomebound") == 0
 
 
 def test_quota_guard_is_off_unless_explicitly_enabled():

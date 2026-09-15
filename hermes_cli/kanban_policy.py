@@ -50,6 +50,12 @@ DEFAULT_QUOTA_MAX_AGE_SECONDS = 1800
 DEFAULT_GLOBAL_MAX_IN_PROGRESS = 2
 DEFAULT_MAX_UNATTENDED_PCT = 75
 
+# Budget handed to a board when the global cap is disabled. The dispatch call
+# site takes ``min(global_budget, configured_cap)``, so a sentinel this large
+# makes the policy layer a no-op there and leaves the per-board caps in sole
+# charge — rather than needing a separate "is it None" branch at every caller.
+UNLIMITED = 1_000_000
+
 # Per-role soft runtime limits (seconds). At the soft limit the lead is asked
 # what to do; the hard limit is a multiple of it and is not negotiable.
 DEFAULT_RUNTIME_SOFT_SECONDS = {"coder": 7200, "tester": 9000, "reviewer": 5400}
@@ -311,8 +317,27 @@ def load_policy_config(cfg: Optional[dict]) -> dict:
     for role, val in soft.items():
         soft_seconds[str(role)] = _pos_int(val, DEFAULT_RUNTIME_SOFT_SECONDS.get(str(role), 7200))
 
+    def _cap(value, default):
+        """Global cap, where 0 (or negative) explicitly means *no cap*.
+
+        This knob needs a real off switch. Routing 0 through ``_pos_int``
+        silently promoted it back to the default, so an operator who set
+        ``global_max_in_progress: 0`` to lift the cross-board limit got the
+        default of 2 instead — the opposite of what they asked for, with
+        nothing in the log to say so. ``None``/absent still means "use the
+        default"; 0 means "the global layer does not apply, fall back to the
+        per-board caps".
+        """
+        if value is None:
+            return default
+        try:
+            ival = int(value)
+        except (TypeError, ValueError):
+            return default
+        return None if ival <= 0 else ival
+
     return {
-        "global_max_in_progress": _pos_int(
+        "global_max_in_progress": _cap(
             kan.get("global_max_in_progress"), DEFAULT_GLOBAL_MAX_IN_PROGRESS
         ),
         "board_priority": priority,
@@ -406,7 +431,10 @@ def plan_dispatch(
     so work already in flight always gets to finish. That is the whole point
     of pausing at a threshold below 100 rather than at the wall.
     """
-    cap = policy.get("global_max_in_progress") or DEFAULT_GLOBAL_MAX_IN_PROGRESS
+    # `None` means the operator turned the global layer off; it is NOT the
+    # same as absent. Using `or` here would resurrect the default and silently
+    # re-impose a cap they asked to remove.
+    cap = policy.get("global_max_in_progress", DEFAULT_GLOBAL_MAX_IN_PROGRESS)
     total_running = sum(int(v) for v in board_running.values())
     plan = DispatchPlan(global_running=total_running, global_cap=cap)
 
@@ -426,6 +454,21 @@ def plan_dispatch(
                 for s in ordered
             ]
             return plan
+
+    if cap is None:
+        # No global layer: every board gets an unbounded budget and the
+        # per-board / per-profile caps inside dispatch_once are the only
+        # concurrency limit. Board order still holds, so priority survives.
+        plan.boards = [
+            BoardPlan(
+                slug=s,
+                allowed=UNLIMITED,
+                running=int(board_running[s]),
+                reason="global cap disabled",
+            )
+            for s in ordered
+        ]
+        return plan
 
     budget = max(0, cap - total_running)
     for slug in ordered:
