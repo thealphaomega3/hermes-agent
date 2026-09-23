@@ -1,11 +1,17 @@
 """Regression tests for iteration-limit exit normalization (#61631)."""
 
+import logging
 from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import pytest
 
-from agent.turn_finalizer import finalize_turn
+from agent.turn_finalizer import _record_kanban_budget_exhausted, finalize_turn
+from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from tests.hermes_cli.test_kanban_db import (
+    kanban_home,  # noqa: F401 — shared temp-HERMES_HOME + kanban DB fixture
+)
 
 
 class _LimitAgent:
@@ -190,10 +196,79 @@ def test_pending_response_records_kanban_timeout(monkeypatch):
             "within the allowed iterations"
         ),
         outcome="timed_out",
+        force_trip=True,
         release_claim=True,
         end_run=True,
         event_payload_extra={"budget_used": 60, "budget_max": 60},
     )
+
+
+def test_budget_exhaustion_trips_breaker_on_first_occurrence(kanban_home):
+    """Real-path contract: a run that spent its whole iteration budget blocks the
+    card for an operator on the FIRST occurrence instead of being respawned once.
+
+    The respawn is exactly what burned a second full budget — the retry started
+    10s later, found the prior run's work still uncommitted in the worktree, and
+    spent another 300 calls. A same-budget rerun cannot fit what the first run
+    could not fit, so ``_record_kanban_budget_exhausted`` passes
+    ``force_trip=True`` and the ``gave_up`` event is stamped ``sticky``, which
+    makes ``recompute_ready`` hold the card.
+    """
+    with kbc.connect_closing() as conn:
+        tid = kb.create_task(conn, title="budget burner")
+        assert kb.claim_task(conn, tid) is not None
+        running = kb.get_task(conn, tid)
+        assert running is not None
+        assert running.status == "running"
+        assert running.current_run_id is not None
+
+    _record_kanban_budget_exhausted(tid, 300, 300, logging.getLogger(__name__))
+
+    with kbc.connect_closing() as conn:
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        assert task.status == "blocked"
+        assert task.current_run_id is None
+        assert task.claim_lock is None
+
+        gave_up = [event for event in kb.list_events(conn, tid) if event.kind == "gave_up"]
+        assert len(gave_up) == 1
+        payload = gave_up[0].payload or {}
+        assert payload["sticky"] is True
+        assert payload["trigger_outcome"] == "timed_out"
+        assert payload["budget_used"] == 300
+        assert payload["budget_max"] == 300
+        assert "Iteration budget exhausted (300/300)" in payload["error"]
+
+        runs = kb.list_runs(conn, tid)
+        assert [run.outcome for run in runs] == ["gave_up"]
+        ended_at = runs[0].ended_at
+        assert ended_at is not None
+
+        # Dispatcher tick: the sticky block is held for an operator, not
+        # promoted back to ``ready`` for a same-budget respawn.
+        assert kb.recompute_ready(conn) == 0
+        still_blocked = kb.get_task(conn, tid)
+        assert still_blocked is not None
+        assert still_blocked.status == "blocked"
+
+        failures_before = task.consecutive_failures
+        error_before = task.last_failure_error
+
+    # A second exit path re-recording the same exhaustion is a no-op on every
+    # piece of state the dispatcher reads: no new run, no reopened card.
+    _record_kanban_budget_exhausted(tid, 300, 300, logging.getLogger(__name__))
+
+    with kbc.connect_closing() as conn:
+        again = kb.get_task(conn, tid)
+        assert again is not None
+        assert again.status == "blocked"
+        assert again.current_run_id is None
+        assert again.consecutive_failures == failures_before
+        assert again.last_failure_error == error_before
+        assert [(run.outcome, run.ended_at) for run in kb.list_runs(conn, tid)] == [
+            ("gave_up", ended_at)
+        ]
 
 
 def test_published_pending_candidate_is_not_duplicated_by_finalizer(monkeypatch):
@@ -271,6 +346,7 @@ def test_bounded_fallback_records_kanban_failure_when_interrupted(monkeypatch):
     args, kwargs = record.call_args
     assert args[1] == "task-456"
     assert kwargs["outcome"] == "timed_out"
+    assert kwargs["force_trip"] is True
     assert kwargs["release_claim"] is True
     assert kwargs["end_run"] is True
     assert kwargs["event_payload_extra"]["budget_used"] == 60
@@ -309,6 +385,7 @@ def test_bounded_fallback_records_kanban_failure_when_failed(monkeypatch):
     args, kwargs = record.call_args
     assert args[1] == "task-789"
     assert kwargs["outcome"] == "timed_out"
+    assert kwargs["force_trip"] is True
 
 
 def test_bounded_fallback_does_not_fire_without_kanban_task(monkeypatch):
