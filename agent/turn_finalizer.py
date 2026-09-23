@@ -45,9 +45,14 @@ def _record_kanban_budget_exhausted(
 ) -> None:
     """Record a terminal ``timed_out`` outcome for a kanban worker out of budget.
 
-    Routed via ``_record_task_failure`` (not ``kanban_block``) so it counts toward the
-    consecutive-failure circuit breaker. Idempotent via the ``_end_run`` CAS
-    (``WHERE ended_at IS NULL``), so safe from multiple exit paths.
+    Routed via ``_record_task_failure`` with ``force_trip=True`` (not ``kanban_block``), so the
+    breaker trips on the FIRST occurrence rather than after ``failure_limit`` retries: the run
+    already spent its whole iteration budget and a respawn restarts from that same budget, so a
+    same-budget retry cannot succeed — it only burns a second full budget on the card (one retry
+    found the prior run's work still uncommitted in the worktree and spent another 300 calls).
+    ``force_trip`` stamps the ``gave_up`` event ``sticky``, so ``recompute_ready`` holds the card
+    for an operator. Crashes, spawn failures and runtime timeouts keep their normal retries; only
+    iteration-budget exhaustion trips immediately.
 
     This is a bounded fallback (#87096): the CAS invariant in ``_end_run`` (``WHERE ended_at IS NULL``)
     guarantees idempotence — if another path already closed the run this is a no-op — so it is safe to call
@@ -67,6 +72,7 @@ def _record_kanban_budget_exhausted(
                     "task could not complete within the allowed iterations"
                 ),
                 outcome="timed_out",
+                force_trip=True,
                 release_claim=True,
                 end_run=True,
                 event_payload_extra={"budget_used": api_call_count, "budget_max": max_iterations},
